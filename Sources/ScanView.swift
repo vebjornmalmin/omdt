@@ -7,16 +7,10 @@ struct ARSceneView: UIViewRepresentable {
     func updateUIView(_ uiView: ARSCNView, context: Context) {}
 }
 
-struct ShareSheet: UIViewControllerRepresentable {
-    let urls: [URL]
-    func makeUIViewController(context: Context) -> UIActivityViewController {
-        UIActivityViewController(activityItems: urls, applicationActivities: nil)
-    }
-    func updateUIViewController(_ vc: UIActivityViewController, context: Context) {}
-}
-
 struct ScanView: View {
     @StateObject private var scan = ScanController()
+    @State private var scansSheet: ScansRoute?
+    @AppStorage("showDebugPanel") private var showDebug = true
 
     var body: some View {
         ZStack {
@@ -32,6 +26,8 @@ struct ScanView: View {
                 HStack(spacing: 14) {
                     Label(scan.trackingText, systemImage: "viewfinder")
                     Spacer()
+                    Label("\(scan.keyframeCount)", systemImage: "camera")
+                        .monospacedDigit()
                     Label(scan.detailText, systemImage: "scope")
                     Text("\(scan.triangleCount.formatted()) tris")
                         .monospacedDigit()
@@ -40,6 +36,8 @@ struct ScanView: View {
                 .padding(10)
                 .background(.ultraThinMaterial, in: Capsule())
                 .padding(.horizontal)
+
+                if showDebug { DebugPanel().padding(.horizontal).padding(.top, 4) }
 
                 Spacer()
 
@@ -60,24 +58,54 @@ struct ScanView: View {
                 }
                 .padding(.bottom, 6)
 
-                Button { scan.export() } label: {
-                    HStack {
-                        if scan.isExporting { ProgressView() }
-                        Text(scan.isExporting ? "Exporting…" : "Export PLY")
+                HStack(spacing: 10) {
+                    Button { scan.save() } label: {
+                        HStack {
+                            if scan.isSaving { ProgressView() }
+                            Text(scan.isSaving ? "Saving…" : "Save scan")
+                        }
+                        .font(.headline).frame(maxWidth: .infinity).padding(.vertical, 12)
                     }
-                    .font(.headline).frame(maxWidth: .infinity).padding(.vertical, 12)
+                    .buttonStyle(.borderedProminent)
+                    .disabled(scan.triangleCount == 0 || scan.isSaving)
+
+                    Button {
+                        scansSheet = ScansRoute(open: nil)
+                    } label: {
+                        Image(systemName: "square.stack.3d.up").font(.headline).padding(.vertical, 12)
+                    }
+                    .buttonStyle(.bordered)
+                    .accessibilityLabel("Saved scans")
+
+                    Button { showDebug.toggle() } label: {
+                        Image(systemName: showDebug ? "ladybug.fill" : "ladybug").font(.headline).padding(.vertical, 12)
+                    }
+                    .buttonStyle(.bordered)
+                    .accessibilityLabel(showDebug ? "Hide debug info" : "Show debug info")
                 }
-                .buttonStyle(.borderedProminent)
-                .disabled(scan.triangleCount == 0 || scan.isExporting)
                 .padding(.horizontal).padding(.bottom, 8)
             }
         }
-        .sheet(item: $scan.shareItem) { ShareSheet(urls: $0.urls) }
+        .sheet(item: $scansSheet) { ScansListView(open: $0.open) }
+        // The camera stops while the scans sheet covers it and comes back live afterwards.
+        .onChange(of: scansSheet?.id) { _, id in id == nil ? scan.resumeCamera() : scan.suspendCamera() }
+        .onChange(of: scan.savedScan) { _, saved in
+            if let saved { scansSheet = ScansRoute(open: saved); scan.savedScan = nil }
+        }
         .alert("Error", isPresented: Binding(get: { scan.errorMessage != nil },
                                              set: { if !$0 { scan.errorMessage = nil } })) {
             Button("OK", role: .cancel) {}
         } message: { Text(scan.errorMessage ?? "") }
         .onAppear { UIApplication.shared.isIdleTimerDisabled = true }
+        .task {
+            scan.startCamera()
+            // `devicectl device process launch ... com.vebjorn.LidarScan -autostart` starts scanning
+            // without a tap, so a run can be observed from the Mac.
+            if ProcessInfo.processInfo.arguments.contains("-autostart") {
+                try? await Task.sleep(for: .seconds(1))
+                if !scan.isScanning { scan.toggleScanning() }
+            }
+        }
     }
 
     private func roundButton(_ icon: String, action: @escaping () -> Void) -> some View {

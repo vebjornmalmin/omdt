@@ -4,7 +4,10 @@ import simd
 /// Binary little-endian PLY with per-vertex color and normals, written straight into a
 /// preallocated buffer by all cores at once.
 enum MeshExporter {
-    static func exportPLY(_ meshes: [MeshOut]) throws -> URL {
+    static let vertexBytes = 27   // 6 floats + 3 bytes
+    static let faceBytes = 13     // count byte + 3 int32
+
+    static func plyData(_ meshes: [MeshOut]) throws -> Data {
         var vOff = [Int](), fOff = [Int]()
         var V = 0, F = 0
         for m in meshes { vOff.append(V); fOff.append(F); V += m.pos.count; F += m.idx.count / 3 }
@@ -31,7 +34,7 @@ enum MeshExporter {
 
         """
         let head = Array(header.utf8)
-        let vBytes = 27, fBytes = 13
+        let vBytes = vertexBytes, fBytes = faceBytes
         let vStart = head.count, fStart = vStart + V * vBytes
         var data = Data(count: fStart + F * fBytes)
 
@@ -65,14 +68,58 @@ enum MeshExporter {
                 }
             }
         }
+        return data
+    }
 
-        let dir = try FileManager.default.url(for: .documentDirectory, in: .userDomainMask,
-                                              appropriateFor: nil, create: true)
-            .appendingPathComponent("Scans", isDirectory: true)
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let fmt = DateFormatter(); fmt.dateFormat = "yyyyMMdd-HHmmss"
-        let url = dir.appendingPathComponent("Scan-\(fmt.string(from: Date())).ply")
-        try data.write(to: url, options: .atomic)
-        return url
+    /// Reads a PLY written by `plyData` back into a single mesh.
+    static func readPLY(_ url: URL) throws -> MeshOut {
+        let data = try Data(contentsOf: url, options: .mappedIfSafe)
+        func fail(_ why: String) -> NSError {
+            NSError(domain: "PLY", code: 1, userInfo: [NSLocalizedDescriptionKey: "Can't read mesh: \(why)"])
+        }
+        let marker = Array("end_header\n".utf8)
+        guard let end = data.prefix(4096).firstRange(of: marker) else { throw fail("no header") }
+        guard let header = String(data: data[..<end.lowerBound], encoding: .ascii) else { throw fail("bad header") }
+
+        let lines = header.split(separator: "\n").map(String.init)
+        let expected = ["property float x", "property float y", "property float z",
+                        "property float nx", "property float ny", "property float nz",
+                        "property uchar red", "property uchar green", "property uchar blue",
+                        "property list uchar int vertex_indices"]
+        guard lines.first == "ply", lines.contains("format binary_little_endian 1.0"),
+              lines.filter({ $0.hasPrefix("property") }) == expected else { throw fail("unsupported layout") }
+        func count(_ element: String) -> Int? {
+            lines.first { $0.hasPrefix("element \(element) ") }.flatMap { Int($0.split(separator: " ")[2]) }
+        }
+        guard let V = count("vertex"), let F = count("face") else { throw fail("missing counts") }
+
+        let vStart = end.upperBound - data.startIndex, fStart = vStart + V * vertexBytes
+        guard data.count >= fStart + F * faceBytes else { throw fail("file is truncated") }
+
+        var m = MeshOut()
+        m.pos = .init(repeating: .zero, count: V)
+        m.nrm = .init(repeating: .zero, count: V)
+        m.col = .init(repeating: .zero, count: V)
+        m.idx = .init(repeating: 0, count: F * 3)
+        try data.withUnsafeBytes { raw in
+            let b = raw.baseAddress!
+            func f(_ o: Int) -> Float { b.loadUnaligned(fromByteOffset: o, as: Float.self) }
+            for i in 0..<V {
+                let o = vStart + i * vertexBytes
+                m.pos[i] = SIMD3(f(o), f(o + 4), f(o + 8))
+                m.nrm[i] = SIMD3(f(o + 12), f(o + 16), f(o + 20))
+                m.col[i] = SIMD4(raw[o + 24], raw[o + 25], raw[o + 26], 255)
+            }
+            for i in 0..<F {
+                let o = fStart + i * faceBytes
+                guard raw[o] == 3 else { throw fail("non-triangle face") }
+                for k in 0..<3 {
+                    let v = b.loadUnaligned(fromByteOffset: o + 1 + 4 * k, as: Int32.self)
+                    guard v >= 0, Int(v) < V else { throw fail("bad vertex index") }
+                    m.idx[i * 3 + k] = UInt32(v)
+                }
+            }
+        }
+        return m
     }
 }
