@@ -23,6 +23,7 @@ targets:
         CFBundleDisplayName: LiDAR Scan
         UILaunchScreen: {}
         NSCameraUsageDescription: The camera is used together with the LiDAR sensor to capture colored 3D scans.
+        NSLocationWhenInUseUsageDescription: Your rough location is saved with each scan so the app can offer to continue a scan when you are back in the same place.
         UIRequiredDeviceCapabilities: [arkit]
         UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
         UIFileSharingEnabled: true

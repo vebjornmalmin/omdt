@@ -34,6 +34,11 @@ final class Debug {
         var passes = 0
         var passMs: Double = 0
         var passMsAvg: Double = 0
+        var gpuMs: Double = 0
+        var meshMs: Double = 0
+        var fuseRate = 0
+        var fusedThisSecond = 0
+        var fuseSecondStart: TimeInterval = 0
         var skippedBusy = 0
         var blocks = 0
         var keyframes = 0
@@ -45,6 +50,10 @@ final class Debug {
         /// Mean luma of the camera image (0-255); near 0 means covered lens or a dark room.
         var brightness = -1
         var exposure = "–"
+        /// Live room fit, boxes and tagging.
+        var room = "–"
+        var objects = "–"
+        var model = "–"
     }
 
     private init() {
@@ -145,7 +154,7 @@ final class Debug {
     func summaryLine() -> String {
         let s = snapshot()
         return "fps \(s.fps) frames \(s.frames) depth \(s.framesWithDepth) light \(s.brightness) exp \(s.exposure) | \(s.tracking) | map \(s.mapping) | "
-            + "passes \(s.passes) (\(Int(s.passMs)) ms, busy-skips \(s.skippedBusy)) blocks \(s.blocks) | "
+            + "fused \(s.fuseRate)/s (\(String(format: "%.1f", s.passMs)) ms, gpu \(String(format: "%.1f", s.gpuMs)), mesh \(Int(s.meshMs)) ms, skips \(s.skippedBusy)) blocks \(s.blocks) | "
             + "keyframes \(s.keyframes) (\(s.keyframeReason)) | mem \(Int(Self.memoryMB())) MB | \(Self.thermal())"
     }
 

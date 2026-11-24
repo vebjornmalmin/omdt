@@ -43,8 +43,10 @@ struct DebugPanel: View {
         frames    \(s.frames) · depth \(s.framesWithDepth) · \(s.fps) fps · last \(lastFrame)
         camera    \(s.imageSize) · light \(s.brightness)/255 · exp \(s.exposure)
         format    \(s.videoFormat) · depth \(s.depthSize)
-        fusion    \(s.passes) passes · \(Int(s.passMs)) ms (avg \(Int(s.passMsAvg))) · skips \(s.skippedBusy) · \(s.blocks) blocks
+        fusion    \(s.fuseRate)/s · \(String(format: "%.1f", s.passMsAvg)) ms (gpu \(String(format: "%.1f", s.gpuMs))) · mesh \(Int(s.meshMs)) ms · skips \(s.skippedBusy) · \(s.blocks) blocks
         photos    \(s.keyframes) · \(Int(s.keyframeMs)) ms · \(s.keyframeReason)
+        room      \(s.room)
+        objects   \(s.objects) · AI \(s.model)
         device    \(Int(Debug.memoryMB())) MB · \(Debug.thermal()) · int \(s.interruptions) · err \(s.errors) · \(Debug.buildDate)
         """
     }

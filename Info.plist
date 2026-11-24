@@ -24,6 +24,8 @@
 	<true/>
 	<key>NSCameraUsageDescription</key>
 	<string>The camera is used together with the LiDAR sensor to capture colored 3D scans.</string>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>Your rough location is saved with each scan so the app can offer to continue a scan when you are back in the same place.</string>
 	<key>UIFileSharingEnabled</key>
 	<true/>
 	<key>UILaunchScreen</key>

@@ -15,8 +15,12 @@ struct ScansListView: View {
     @State private var scans: [ScanBundle] = []
     @State private var path: [ScanBundle]
     @State private var loaded = false
+    let onContinue: (ScanBundle) -> Void
 
-    init(open: ScanBundle?) { _path = State(initialValue: open.map { [$0] } ?? []) }
+    init(open: ScanBundle?, onContinue: @escaping (ScanBundle) -> Void) {
+        _path = State(initialValue: open.map { [$0] } ?? [])
+        self.onContinue = onContinue
+    }
 
     var body: some View {
         NavigationStack(path: $path) {
@@ -36,7 +40,7 @@ struct ScansListView: View {
                 }
             }
             .navigationTitle("Scans")
-            .navigationDestination(for: ScanBundle.self) { ScanDetailView(scan: $0) }
+            .navigationDestination(for: ScanBundle.self) { ScanDetailView(scan: $0, onContinue: onContinue) }
             .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
             .task {
                 scans = await Task.detached { ScanBundle.list() }.value
@@ -89,6 +93,12 @@ final class ScanViewerModel: ObservableObject {
     @Published private(set) var isSnapping = false
     @Published private(set) var roomError: String?
     @Published var layer = Layer.scan { didSet { updateVisibility() } }
+    @Published private(set) var objects: [ObjectBox] = []
+    private var removedBoxes: [ObjectBox]?
+    private var roomType: String?
+    /// Box finder version of the shown boxes (nil: from before versions were saved).
+    @Published private(set) var finder: Int?
+    private let boxes = BoxOverlay(labelHeight: 0.1)
 
     private let meshNode = SCNNode()
     private let camerasNode = SCNNode()
@@ -128,7 +138,11 @@ final class ScanViewerModel: ObservableObject {
             }
             scene.rootNode.addChildNode(highlightNode)
             keyframes = frames
-            if let saved { show(saved.shell) }
+            scene.rootNode.addChildNode(boxes.root)
+            if let saved {
+                removedBoxes = saved.removed; roomType = saved.roomType; finder = saved.finder
+                show(saved.shell, objects: saved.objects ?? [])
+            }
         } catch {
             self.error = error.localizedDescription
         }
@@ -139,19 +153,27 @@ final class ScanViewerModel: ObservableObject {
     func snapToRoom() async {
         guard let mesh, !isSnapping else { return }
         isSnapping = true; roomError = nil
-        let scan = self.scan
-        let result = await Task.detached(priority: .userInitiated) { () -> Result<RoomShell, Error> in
+        let scan = self.scan, previous = objects, removed = removedBoxes, roomType = self.roomType
+        let result = await Task.detached(priority: .userInitiated) { () -> Result<(RoomShell, [ObjectBox], [ObjectBox]?), Error> in
             Result {
                 let shell = try RoomFitter.fit([mesh])
-                try? scan.saveRoom(RoomModel(shell: shell))
-                return shell
+                let found = ObjectFinder.find(RoomFitter.sample([mesh], cell: 0.03), shell: shell)
+                var tracker = BoxTracker(seed: previous)          // keep labels from earlier
+                let objects = Array(tracker.update(found).prefix(found.count))
+                let (room, notes) = RoomCorrector.correct(RoomModel(shell: shell, objects: objects, removed: removed,
+                                                                     roomType: roomType, finder: ObjectFinder.version))
+                for n in notes { Debug.shared.log("clean up: " + n) }
+                try? scan.saveRoom(room)
+                return (shell, room.objects ?? [], room.removed)
             }
         }.value
         switch result {
-        case .success(let shell):
-            Debug.shared.log("snap to room \(scan.meta.id): \(shell.walls.count) walls, "
+        case .success(let (shell, objects, removed)):
+            removedBoxes = removed
+            finder = ObjectFinder.version
+            Debug.shared.log("snap to room \(scan.meta.id): \(shell.walls.count) walls, \(objects.count) boxes, "
                              + String(format: "%.1f m², %.2f m high, ", shell.area, shell.height) + shell.notes)
-            show(shell)
+            show(shell, objects: objects)
         case .failure(let e):
             Debug.shared.log("snap to room FAILED: \(e)")
             roomError = e.localizedDescription
@@ -159,19 +181,37 @@ final class ScanViewerModel: ObservableObject {
         isSnapping = false
     }
 
-    private func show(_ shell: RoomShell) {
+    private func show(_ shell: RoomShell, objects: [ObjectBox]) {
         roomNode.removeFromParentNode()
         roomNode = RoomGeometry.node(shell)
         scene.rootNode.addChildNode(roomNode)
         room = shell
+        self.objects = objects
+        boxes.update(objects)
         layer = .both
     }
 
     func keyframe(_ id: Int) -> Keyframe? { keyframes.first { $0.id == id } }
 
+    /// The fitted room with its boxes, for the Room screen.
+    var roomModel: RoomModel? {
+        room.map { RoomModel(shell: $0, objects: objects, removed: removedBoxes, roomType: roomType, finder: finder) }
+    }
+    var scanGeometry: SCNGeometry? { meshNode.geometry }
+
+    /// Shows a room edited on the Room screen (already saved there).
+    func apply(_ edited: RoomModel) {
+        room = edited.shell
+        objects = edited.objects ?? []
+        removedBoxes = edited.removed
+        roomType = edited.roomType
+        boxes.update(objects)
+    }
+
     private func updateVisibility() {
         meshNode.isHidden = layer == .room
         roomNode.isHidden = layer == .scan
+        boxes.root.isHidden = layer == .scan
         camerasNode.isHidden = !showCameras || layer == .room
     }
 
@@ -186,8 +226,13 @@ final class ScanViewerModel: ObservableObject {
 
 struct ScanDetailView: View {
     @StateObject private var model: ScanViewerModel
+    @State private var editingRoom = false
+    let onContinue: (ScanBundle) -> Void
 
-    init(scan: ScanBundle) { _model = StateObject(wrappedValue: ScanViewerModel(scan: scan)) }
+    init(scan: ScanBundle, onContinue: @escaping (ScanBundle) -> Void) {
+        _model = StateObject(wrappedValue: ScanViewerModel(scan: scan))
+        self.onContinue = onContinue
+    }
 
     var body: some View {
         ZStack(alignment: .bottom) {
@@ -218,9 +263,16 @@ struct ScanDetailView: View {
                     .accessibilityLabel(model.showCameras ? "Hide camera positions" : "Show camera positions")
                 }
                 ShareLink(item: model.scan.meshURL)
+                Button { onContinue(model.scan) } label: { Label("Continue scanning", systemImage: "record.circle") }
+                    .disabled(!model.scan.canContinue)
             }
         }
         .task { await model.load() }
+        .navigationDestination(isPresented: $editingRoom) {
+            if let room = model.roomModel {
+                RoomEditView(scan: model.scan, room: room, scanGeometry: model.scanGeometry) { model.apply($0) }
+            }
+        }
     }
 
     /// Snap to room, then the layer switch and the room's size.
@@ -241,6 +293,19 @@ struct ScanDetailView: View {
                 }
                 Text(room.notes).font(.caption2).foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
+                if (model.finder ?? 0) < ObjectFinder.version {
+                    Text("These boxes were found by an older version. Tap ↻ to find them again; names are kept.")
+                        .font(.footnote).foregroundStyle(.yellow).frame(maxWidth: .infinity, alignment: .leading)
+                }
+                if room.looksLikeSeveralRooms {
+                    Text("This scan looks like more than one room. The room model works best with one room per scan.")
+                        .font(.footnote).foregroundStyle(.yellow).frame(maxWidth: .infinity, alignment: .leading)
+                }
+                Button { editingRoom = true } label: {
+                    Label("Open room", systemImage: "cube.transparent")
+                        .font(.headline).frame(maxWidth: .infinity).padding(.vertical, 4)
+                }
+                .buttonStyle(.borderedProminent)
             } else {
                 Button { Task { await model.snapToRoom() } } label: {
                     HStack {
@@ -266,6 +331,8 @@ struct ScanDetailView: View {
                        r.extent.max() ?? 0, r.extent.min() ?? 0, r.height, r.ceilingObserved ? "" : " (guess)",
                        r.area, sides)
         if guessed > 0 { s += " (\(guessed) guessed)" }
+        let named = model.objects.filter { $0.label != nil }.count
+        s += " · \(model.objects.count) things, \(named) named"
         return s
     }
 

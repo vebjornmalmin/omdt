@@ -21,6 +21,10 @@ final class KeyframeRecorder {
     private var busy = false
     private var generation = 0
     private var frames: [Keyframe] = []
+    /// Index of the first keyframe of this recording; above 0 when continuing a saved scan.
+    private var startIndex = 0
+    /// False when recording into a saved scan's folder, which must survive a cancel.
+    private var ownsDir = true
 
     var recordingDirectory: URL? { lock.lock(); defer { lock.unlock() }; return dir }
 
@@ -28,21 +32,51 @@ final class KeyframeRecorder {
     func begin() throws {
         let newDir = try ScanBundle.makeRecordingDirectory()
         lock.lock()
-        let old = dir
+        let old = dir, oldOwned = ownsDir, oldStart = startIndex
         dir = newDir; generation += 1; selector.reset(); frames.removeAll(); busy = false
+        startIndex = 0; ownsDir = true
         lock.unlock()
-        if let old { removeLater(old) }
+        if let old { discard(old, owned: oldOwned, from: oldStart) }
         report(0)
+    }
+
+    /// Records more keyframes into a saved scan, numbered after its existing ones.
+    func begin(continuing scan: ScanBundle) throws {
+        let existing = try scan.keyframes()
+        lock.lock()
+        let old = dir, oldOwned = ownsDir, oldStart = startIndex
+        dir = scan.url; generation += 1; selector.reset(); busy = false
+        frames = existing
+        startIndex = (existing.map(\.id).max() ?? -1) + 1
+        ownsDir = false
+        lock.unlock()
+        if let old { discard(old, owned: oldOwned, from: oldStart) }
+        report(existing.count)
     }
 
     /// Stops recording and deletes what was recorded.
     func cancel() {
         lock.lock()
-        let old = dir
+        let old = dir, oldOwned = ownsDir, oldStart = startIndex
         dir = nil; generation += 1; selector.reset(); frames.removeAll(); busy = false
+        startIndex = 0; ownsDir = true
         lock.unlock()
-        if let old { removeLater(old) }
+        if let old { discard(old, owned: oldOwned, from: oldStart) }
         report(0)
+    }
+
+    /// Deletes a recording folder, or only this session's new files in a saved scan's folder.
+    private func discard(_ url: URL, owned: Bool, from start: Int) {
+        if owned { removeLater(url); return }
+        queue.async {
+            let fm = FileManager.default
+            for sub in ["frames", "depth"] {
+                let d = url.appendingPathComponent(sub)
+                for f in (try? fm.contentsOfDirectory(atPath: d.path)) ?? [] {
+                    if let n = Int(f.prefix { $0.isNumber }), n >= start { try? fm.removeItem(at: d.appendingPathComponent(f)) }
+                }
+            }
+        }
     }
 
     /// Waits for pending writes, then hands over the recording. Recording stops.
@@ -51,7 +85,7 @@ final class KeyframeRecorder {
         lock.lock(); defer { lock.unlock() }
         guard let d = dir else { return nil }
         let result = (d, frames.sorted { $0.id < $1.id })
-        dir = nil; generation += 1; selector.reset(); frames.removeAll()
+        dir = nil; generation += 1; selector.reset(); frames.removeAll(); startIndex = 0; ownsDir = true
         return result
     }
 
@@ -72,7 +106,7 @@ final class KeyframeRecorder {
             Debug.shared.update { $0.keyframeReason = why }
             return
         }
-        let index = selector.count
+        let index = startIndex + selector.count
         selector.didCapture(t, time: frame.timestamp)
         busy = true
         let gen = generation
@@ -83,7 +117,7 @@ final class KeyframeRecorder {
             var kf: Keyframe?
             do { kf = try write(frame, index: index, to: d) } catch { Debug.shared.log("keyframe \(index) FAILED: \(error)") }
             let ms = Date().timeIntervalSince(t0) * 1000
-            Debug.shared.update { $0.keyframes = index + 1; $0.keyframeMs = ms; $0.keyframeReason = "saved #\(index)" }
+            Debug.shared.update { $0.keyframes += 1; $0.keyframeMs = ms; $0.keyframeReason = "saved #\(index)" }
             lock.lock()
             let current = gen == generation
             if current { busy = false; if let kf { frames.append(kf) } }

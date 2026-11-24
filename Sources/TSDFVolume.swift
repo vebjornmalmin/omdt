@@ -1,4 +1,5 @@
 import Foundation
+import Metal
 import simd
 
 // Multi-resolution TSDF fusion. Voxel size depends on how far the camera was from the
@@ -74,15 +75,51 @@ final class TSDFVolume {
     private var dirtyFlag: [Bool] = []
     private var dirtyList: [Int32] = []
 
+    // Voxel memory: blocks are packed into chunks, block i at slot i % blocksPerChunk of chunk
+    // i / blocksPerChunk. With the GPU the chunks are shared Metal buffers, so the GPU integrates
+    // into the same memory the CPU meshes and saves from.
+    static let blocksPerChunk = 512
+    private let gpu: GPUFusion?
+    private var chunks: [MTLBuffer] = []
+    private var rawChunks: [UnsafeMutableRawPointer] = []
+
     var blockCount: Int { ptrs.count }
     var allBlocks: [Int32] { (0..<Int32(ptrs.count)).map { $0 } }
+    var usesGPU: Bool { gpu != nil }
+    /// GPU time of the last integration, in ms (0 on the CPU).
+    var lastGPUms: Double { gpu?.lastGPUms ?? 0 }
+
+    init(useGPU: Bool = true) {
+        gpu = useGPU ? GPUFusion() : nil
+    }
 
     deinit { reset() }
 
     func reset() {
-        for p in ptrs { p.deallocate() }
+        for r in rawChunks { r.deallocate() }
+        rawChunks.removeAll(); chunks.removeAll()
         ptrs.removeAll(); map.removeAll(); levelOf.removeAll()
         coordOf.removeAll(); dirtyFlag.removeAll(); dirtyList.removeAll()
+    }
+
+    /// Memory for the next block, zeroed.
+    private func allocBlock() -> UnsafeMutablePointer<Voxel> {
+        let n3 = Self.B * Self.B * Self.B
+        let blockBytes = n3 * MemoryLayout<Voxel>.stride
+        let i = ptrs.count, chunk = i / Self.blocksPerChunk, slot = i % Self.blocksPerChunk
+        let have = gpu != nil ? chunks.count : rawChunks.count
+        if chunk == have {
+            let bytes = Self.blocksPerChunk * blockBytes
+            if let gpu, let buf = gpu.device.makeBuffer(length: bytes, options: .storageModeShared) {
+                chunks.append(buf)
+            } else {
+                rawChunks.append(UnsafeMutableRawPointer.allocate(byteCount: bytes, alignment: 64))
+            }
+        }
+        let base = gpu != nil ? chunks[chunk].contents() : rawChunks[chunk]
+        let p = (base + slot * blockBytes).bindMemory(to: Voxel.self, capacity: n3)
+        memset(p, 0, blockBytes)
+        return p
     }
 
     // MARK: keys
@@ -156,8 +193,7 @@ final class TSDFVolume {
         for k in keySet {
             if let i = map[k] { active.append(i); continue }
             let (l, x, y, z) = Self.decode(k)
-            let p = UnsafeMutablePointer<Voxel>.allocate(capacity: B * B * B)
-            p.initialize(repeating: Voxel(), count: B * B * B)
+            let p = allocBlock()
             let i = Int32(ptrs.count)
             ptrs.append(p); levelOf.append(UInt8(l))
             coordOf.append(SIMD3(Int32(x), Int32(y), Int32(z)))
@@ -165,12 +201,24 @@ final class TSDFVolume {
             active.append(i)
         }
 
-        // 2. Integrate every active block in parallel (each voxel has one writer).
+        // 2. Integrate every active block: on the GPU, one thread per voxel, or in parallel on
+        //    the CPU (each voxel has one writer either way).
         var touched = [UInt8](repeating: 0, count: active.count)
-        touched.withUnsafeMutableBufferPointer { tp in
-            active.withUnsafeBufferPointer { ap in
-                DispatchQueue.concurrentPerform(iterations: ap.count) { ai in
-                    tp[ai] = self.integrateBlock(Int(ap[ai]), d, w2c, color) ? 1 : 0
+        if let gpu, chunks.count * Self.blocksPerChunk >= ptrs.count {
+            let list = active.enumerated().map { ai, bi -> (chunk: Int, block: GPUFusion.Block) in
+                let c = coordOf[Int(bi)]
+                return (Int(bi) / Self.blocksPerChunk,
+                        GPUFusion.Block(x: c.x, y: c.y, z: c.z, level: Int32(levelOf[Int(bi)]),
+                                        slot: UInt32(Int(bi) % Self.blocksPerChunk), index: UInt32(ai)))
+            }
+            let t = gpu.integrate(blocks: list, chunks: chunks, depth: d, color: color, w2c: w2c)
+            for (ai, on) in t.enumerated() where on { touched[ai] = 1 }
+        } else {
+            touched.withUnsafeMutableBufferPointer { tp in
+                active.withUnsafeBufferPointer { ap in
+                    DispatchQueue.concurrentPerform(iterations: ap.count) { ai in
+                        tp[ai] = self.integrateBlock(Int(ap[ai]), d, w2c, color) ? 1 : 0
+                    }
                 }
             }
         }
@@ -450,5 +498,94 @@ final class TSDFVolume {
             }
         } } }
         return res
+    }
+}
+
+// MARK: saving
+
+extension TSDFVolume {
+    private static let magic: UInt32 = 0x5453_4446   // "TSDF"
+    private static let fileVersion: UInt32 = 1
+    private static let fileBlocksPerChunk = 256
+
+    enum FileError: LocalizedError {
+        case badFile(String)
+        var errorDescription: String? { if case .badFile(let s) = self { return "Can't read the saved volume: \(s)" }; return nil }
+    }
+
+    /// Writes all blocks: a header, then LZFSE-compressed chunks of (keys, voxels), each
+    /// prefixed with its compressed and raw sizes. Chunking keeps memory use small.
+    func write(to url: URL) throws {
+        FileManager.default.createFile(atPath: url.path, contents: nil)
+        let fh = try FileHandle(forWritingTo: url)
+        defer { try? fh.close() }
+        var header = Data()
+        for v in [Self.magic, Self.fileVersion, UInt32(Self.B), UInt32(MemoryLayout<Voxel>.stride), UInt32(ptrs.count)] {
+            withUnsafeBytes(of: v.littleEndian) { header.append(contentsOf: $0) }
+        }
+        try fh.write(contentsOf: header)
+        let keyOf = Dictionary(uniqueKeysWithValues: map.map { ($0.value, $0.key) })
+        let n3 = Self.B * Self.B * Self.B
+        let blockBytes = n3 * MemoryLayout<Voxel>.stride
+        for start in stride(from: 0, to: ptrs.count, by: Self.fileBlocksPerChunk) {
+            let end = min(ptrs.count, start + Self.fileBlocksPerChunk)
+            var raw = Data(capacity: (end - start) * (8 + blockBytes))
+            for i in start..<end {
+                withUnsafeBytes(of: keyOf[Int32(i)]!.littleEndian) { raw.append(contentsOf: $0) }
+            }
+            for i in start..<end { raw.append(UnsafeRawPointer(ptrs[i]).assumingMemoryBound(to: UInt8.self), count: blockBytes) }
+            let packed = try (raw as NSData).compressed(using: .lzfse) as Data
+            var sizes = Data()
+            for v in [UInt64(packed.count), UInt64(raw.count)] { withUnsafeBytes(of: v.littleEndian) { sizes.append(contentsOf: $0) } }
+            try fh.write(contentsOf: sizes)
+            try fh.write(contentsOf: packed)
+        }
+    }
+
+    /// Replaces the volume's contents with a saved one and marks every block dirty.
+    func read(from url: URL) throws {
+        reset()
+        let data = try Data(contentsOf: url, options: .mappedIfSafe)
+        var off = 0
+        func u32() throws -> UInt32 {
+            guard off + 4 <= data.count else { throw FileError.badFile("truncated header") }
+            defer { off += 4 }
+            return data.withUnsafeBytes { UInt32(littleEndian: $0.loadUnaligned(fromByteOffset: off, as: UInt32.self)) }
+        }
+        func u64() throws -> UInt64 {
+            guard off + 8 <= data.count else { throw FileError.badFile("truncated chunk") }
+            defer { off += 8 }
+            return data.withUnsafeBytes { UInt64(littleEndian: $0.loadUnaligned(fromByteOffset: off, as: UInt64.self)) }
+        }
+        guard try u32() == Self.magic, try u32() == Self.fileVersion else { throw FileError.badFile("unknown format") }
+        guard try u32() == UInt32(Self.B), try u32() == UInt32(MemoryLayout<Voxel>.stride) else {
+            throw FileError.badFile("different block layout")
+        }
+        let total = Int(try u32())
+        let n3 = Self.B * Self.B * Self.B
+        let blockBytes = n3 * MemoryLayout<Voxel>.stride
+        var loaded = 0
+        while loaded < total {
+            let packedSize = Int(try u64()), rawSize = Int(try u64())
+            guard off + packedSize <= data.count else { throw FileError.badFile("truncated data") }
+            let raw = try (data.subdata(in: off..<(off + packedSize)) as NSData).decompressed(using: .lzfse) as Data
+            off += packedSize
+            let count = rawSize / (8 + blockBytes)
+            guard raw.count == rawSize, count > 0, count * (8 + blockBytes) == rawSize else { throw FileError.badFile("bad chunk") }
+            raw.withUnsafeBytes { rb in
+                for j in 0..<count {
+                    let k = UInt64(littleEndian: rb.loadUnaligned(fromByteOffset: j * 8, as: UInt64.self))
+                    let (l, x, y, z) = Self.decode(k)
+                    let p = allocBlock()
+                    memcpy(p, rb.baseAddress! + count * 8 + j * blockBytes, blockBytes)
+                    let i = Int32(ptrs.count)
+                    ptrs.append(p); levelOf.append(UInt8(l))
+                    coordOf.append(SIMD3(Int32(x), Int32(y), Int32(z)))
+                    dirtyFlag.append(false); map[k] = i
+                    markDirty(Int(i))
+                }
+            }
+            loaded += count
+        }
     }
 }

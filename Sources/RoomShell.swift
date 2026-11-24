@@ -48,6 +48,23 @@ struct RoomModel: Codable, Equatable {
     static let currentVersion = 1
     var version = RoomModel.currentVersion
     var shell: RoomShell
+    /// Boxes around furniture and other things, with their labels. Missing in older files.
+    var objects: [ObjectBox]?
+    /// Boxes taken out of `objects`: pieces of wall, floor or ceiling, doors, windows, and boxes
+    /// deleted by hand (`kind` says which). Kept so they stay out when the room is fitted again.
+    var removed: [ObjectBox]?
+    /// What kind of room the review thinks this is ("bedroom", "office").
+    var roomType: String?
+    /// `ObjectFinder.version` that found the boxes; missing in files from before it was stored.
+    var finder: Int?
+
+    /// True for a room whose boxes came from an older box finder; Snap again finds them anew.
+    var hasOldBoxes: Bool { (finder ?? 0) < ObjectFinder.version }
+}
+
+extension RoomShell {
+    /// True when the outline is too big for one room: a walk through a whole flat or office.
+    var looksLikeSeveralRooms: Bool { area > 60 || (extent.max() ?? 0) > 12 }
 }
 
 extension ScanBundle {
@@ -93,13 +110,17 @@ enum RoomFitter {
         }
     }
 
-    struct Sample { var p: SIMD3<Float>; var n: SIMD3<Float> }
+    struct Sample: Sendable { var p: SIMD3<Float>; var n: SIMD3<Float> }
 
     // MARK: entry point
 
     static func fit(_ meshes: [MeshOut], options o: Options = Options()) throws -> RoomShell {
+        try fit(samples: sample(meshes, cell: o.sampleCell), options: o)
+    }
+
+    /// Fits to points already sampled with `sample` (live scanning keeps them per block).
+    static func fit(samples: [Sample], options o: Options = Options()) throws -> RoomShell {
         let t0 = Date()
-        let samples = sample(meshes, cell: o.sampleCell)
         guard samples.count >= 500 else { throw FitError.tooSmall }
         let sampleArea = o.sampleCell * o.sampleCell
 
@@ -418,7 +439,13 @@ enum RoomFitter {
         var out: [Cut] = []
         for c in cuts.sorted(by: { $0.at < $1.at }) {
             if let last = out.last, c.at - last.at < distance {
-                if (c.plane?.count ?? -1) > (last.plane?.count ?? -1) { out[out.count - 1] = c }
+                var keep = (c.plane?.count ?? -1) > (last.plane?.count ?? -1) ? c : last
+                // Two planes of one wall (an uneven surface): the stronger place, both coverages.
+                if let a = c.plane, let b = last.plane, a.facing == b.facing {
+                    keep.plane!.seen = a.seen.union(b.seen)
+                    keep.plane!.count = a.count + b.count
+                }
+                out[out.count - 1] = keep
             } else {
                 out.append(c)
             }
@@ -460,7 +487,56 @@ enum RoomFitter {
             stack += [(a - 1, b), (a + 1, b), (a, b - 1), (a, b + 1)]
         }
         for i in 0..<nu { for j in 0..<nv { inside[i][j] = !outside[i][j] } }
+        trimWallStrips(&inside, cuts: cuts)
         return inside
+    }
+
+    /// Thin strips along the edge of the plan that lie behind a strong wall facing into the room are
+    /// outside: window recesses, sills and frames behind the real wall surface (the wall seen through
+    /// at the glass), not floor. Without this the wall itself ends up inside and becomes "furniture".
+    /// The band may hold several strips (a sill and a frame plane): every cut up to `maxWidth` in from
+    /// the edge is tried as the real wall, and the strongest one that qualifies wins.
+    static func trimWallStrips(_ inside: inout [[Bool]], cuts: [[Cut]], maxWidth: Float = 0.45) {
+        let nu = inside.count, nv = inside.first?.count ?? 0
+        guard nu > 0, nv > 0 else { return }
+        func get(_ axis: Int, _ a: Int, _ b: Int) -> Bool { axis == 0 ? inside[a][b] : inside[b][a] }
+        func set(_ axis: Int, _ a: Int, _ b: Int) { if axis == 0 { inside[a][b] = false } else { inside[b][a] = false } }
+        for axis in 0..<2 {
+            let n = axis == 0 ? nu : nv, m = axis == 0 ? nv : nu
+            let other = cuts[1 - axis], c = cuts[axis]
+            for low in [true, false] {
+                // The outermost strip that has inside cells.
+                let order = low ? Array(0..<n) : Array((0..<n).reversed())
+                guard let k0 = order.first(where: { a in (0..<m).contains { get(axis, a, $0) } }) else { continue }
+                let edge = low ? c[k0].at : c[k0 + 1].at
+                var best: (band: [Int], cells: [Int], count: Float)?
+                var band: [Int] = [], outerMax: Float = 0
+                var k = k0
+                while k >= 0, k < n {
+                    let innerCut = low ? c[k + 1] : c[k], outerCut = low ? c[k] : c[k + 1]
+                    outerMax = max(outerMax, outerCut.plane?.count ?? 0)
+                    band.append(k)
+                    guard abs(innerCut.at - edge) < maxWidth else { break }
+                    let inner = low ? k + 1 : k - 1
+                    guard inner >= 0, inner < n else { break }
+                    // The cut between the band and the room must be a wall facing into the room,
+                    // stronger than whatever bounds the band strips on the outside.
+                    if let wall = innerCut.plane, wall.facing == (low ? 1 : -1), wall.count > 2 * outerMax,
+                       wall.count > best?.count ?? 0 {
+                        let cells = (0..<m).filter { b in get(axis, inner, b) && band.contains { get(axis, $0, b) } }
+                        var len: Float = 0, seen: Float = 0
+                        for b in cells {
+                            let l = other[b + 1].at - other[b].at
+                            len += l; seen += l * wall.coverage(from: other[b].at, to: other[b + 1].at)
+                        }
+                        if !cells.isEmpty, seen >= 0.6 * len { best = (band, cells, wall.count) }
+                    }
+                    outerMax = max(outerMax, innerCut.plane?.count ?? 0)
+                    k = inner
+                }
+                if let best { for b in best.cells { for a in best.band { set(axis, a, b) } } }
+            }
+        }
     }
 
     /// Outer boundary of the inside cells as cut-grid corners, room on the left, collinear

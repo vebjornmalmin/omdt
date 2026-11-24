@@ -6,6 +6,7 @@ struct LidarScanApp: App {
         WindowGroup {
             ScanView()
                 .preferredColorScheme(.dark)
+                .task { if NamingSelfTest.requested { await NamingSelfTest.run() } }
         }
     }
 }

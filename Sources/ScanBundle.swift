@@ -54,6 +54,25 @@ struct ScanMeta: Codable, Equatable {
     var boundsMax: [Float]
     /// Keyframe used as the scan's thumbnail.
     var coverKeyframe: Int?
+    /// Where the phone was when the scan was saved, to offer continuing it nearby.
+    var location: GeoPoint?
+    /// Last time scanning was continued.
+    var updated: Date?
+}
+
+struct GeoPoint: Codable, Equatable {
+    var latitude: Double
+    var longitude: Double
+    /// Horizontal accuracy in meters.
+    var accuracy: Double
+
+    /// Great-circle distance in meters.
+    func distance(to o: GeoPoint) -> Double {
+        let r = 6_371_000.0, rad = Double.pi / 180
+        let dLat = (o.latitude - latitude) * rad, dLon = (o.longitude - longitude) * rad
+        let a = sin(dLat / 2) * sin(dLat / 2) + cos(latitude * rad) * cos(o.latitude * rad) * sin(dLon / 2) * sin(dLon / 2)
+        return 2 * r * asin(min(1, a.squareRoot()))
+    }
 }
 
 struct ScanBundle: Identifiable, Hashable {
@@ -69,6 +88,10 @@ struct ScanBundle: Identifiable, Hashable {
     static let metaFile = "scan.json"
     static let keyframesFile = "keyframes.json"
     static let meshFile = "mesh.ply"
+    /// ARKit world map, to line up with the room again when continuing.
+    static let worldMapFile = "worldmap.arexperience"
+    /// Fusion volume, so continuing adds to the same surfaces.
+    static let volumeFile = "volume.tsdf"
     static let recordingPrefix = ".recording-"
 
     /// Where scans live. Tests point this at a temporary folder.
@@ -112,6 +135,14 @@ struct ScanBundle: Identifiable, Hashable {
 
     func delete() throws { try FileManager.default.removeItem(at: url) }
 
+    var worldMapURL: URL { url.appendingPathComponent(Self.worldMapFile) }
+    var volumeURL: URL { url.appendingPathComponent(Self.volumeFile) }
+
+    /// Saved with what's needed to pick up scanning later.
+    var canContinue: Bool {
+        FileManager.default.fileExists(atPath: worldMapURL.path) && FileManager.default.fileExists(atPath: volumeURL.path)
+    }
+
     // MARK: recording
 
     static func imagePath(_ i: Int) -> String { String(format: "frames/%04d.jpg", i) }
@@ -135,8 +166,10 @@ struct ScanBundle: Identifiable, Hashable {
     }
 
     /// Writes mesh and metadata into a recording folder and moves it into place as a scan.
+    /// With `existing`, the recording folder is that scan's own folder and it is updated in place.
     static func finalize(recording dir: URL, meshes: [MeshOut], keyframes: [Keyframe],
-                         created: Date = Date()) throws -> ScanBundle {
+                         created: Date = Date(), location: GeoPoint? = nil,
+                         existing: ScanBundle? = nil) throws -> ScanBundle {
         let ply = try MeshExporter.plyData(meshes)
         try ply.write(to: dir.appendingPathComponent(meshFile), options: .atomic)
         try encoder.encode(keyframes).write(to: dir.appendingPathComponent(keyframesFile), options: .atomic)
@@ -148,6 +181,17 @@ struct ScanBundle: Identifiable, Hashable {
             for p in m.pos { lo = simd_min(lo, p); hi = simd_max(hi, p) }
         }
         let cover = keyframes.isEmpty ? nil : keyframes[keyframes.count / 2].id
+
+        if let old = existing {
+            var meta = old.meta
+            meta.keyframeCount = keyframes.count; meta.triangleCount = tris
+            meta.boundsMin = [lo.x, lo.y, lo.z]; meta.boundsMax = [hi.x, hi.y, hi.z]
+            meta.coverKeyframe = meta.coverKeyframe ?? cover
+            meta.location = location ?? meta.location
+            meta.updated = created
+            try encoder.encode(meta).write(to: dir.appendingPathComponent(metaFile), options: .atomic)
+            return ScanBundle(url: old.url, meta: meta)
+        }
 
         let fmt = DateFormatter()
         fmt.locale = Locale(identifier: "en_US_POSIX")
@@ -162,7 +206,7 @@ struct ScanBundle: Identifiable, Hashable {
 
         let meta = ScanMeta(id: id, version: 1, created: created, keyframeCount: keyframes.count,
                             triangleCount: tris, boundsMin: [lo.x, lo.y, lo.z], boundsMax: [hi.x, hi.y, hi.z],
-                            coverKeyframe: cover)
+                            coverKeyframe: cover, location: location)
         try encoder.encode(meta).write(to: dir.appendingPathComponent(metaFile), options: .atomic)
         try FileManager.default.moveItem(at: dir, to: dest)
         return ScanBundle(url: dest, meta: meta)

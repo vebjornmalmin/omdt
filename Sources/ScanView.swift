@@ -11,6 +11,9 @@ struct ScanView: View {
     @StateObject private var scan = ScanController()
     @State private var scansSheet: ScansRoute?
     @AppStorage("showDebugPanel") private var showDebug = true
+    @StateObject private var location = LocationProvider()
+    /// A saved scan made close to here that can be continued.
+    @State private var nearby: (scan: ScanBundle, meters: Double)?
 
     var body: some View {
         ZStack {
@@ -28,6 +31,8 @@ struct ScanView: View {
                     Spacer()
                     Label("\(scan.keyframeCount)", systemImage: "camera")
                         .monospacedDigit()
+                    Label("\(scan.objectCount)", systemImage: "cube")
+                        .monospacedDigit()
                     Label(scan.detailText, systemImage: "scope")
                     Text("\(scan.triangleCount.formatted()) tris")
                         .monospacedDigit()
@@ -36,6 +41,21 @@ struct ScanView: View {
                 .padding(10)
                 .background(.ultraThinMaterial, in: Capsule())
                 .padding(.horizontal)
+
+                if let c = scan.continuing {
+                    Text("Continuing scan from \(c.meta.created.formatted(.dateTime.day().month().hour().minute()))"
+                         + (scan.isLiningUp ? " · lining up" : ""))
+                        .font(.caption.weight(.medium))
+                        .padding(.horizontal, 10).padding(.vertical, 5)
+                        .background(scan.isLiningUp ? Color.orange.opacity(0.8) : Color.green.opacity(0.7), in: Capsule())
+                } else if let n = nearby, !scan.isScanning, scan.triangleCount == 0 {
+                    Button { scan.continueScan(n.scan) } label: {
+                        Label("Continue the scan from \(n.scan.meta.created.formatted(.dateTime.day().month().hour().minute())) "
+                              + "(\(Int(n.meters)) m away)", systemImage: "location.fill")
+                            .font(.caption.weight(.medium))
+                    }
+                    .buttonStyle(.borderedProminent).controlSize(.small)
+                }
 
                 if showDebug { DebugPanel().padding(.horizontal).padding(.top, 4) }
 
@@ -55,14 +75,17 @@ struct ScanView: View {
                     roundButton(scan.showColors ? "paintpalette.fill" : "square.grid.3x3") {
                         scan.setShowColors(!scan.showColors)
                     }
+                    roundButton(scan.showObjects ? "cube.transparent.fill" : "cube.transparent") {
+                        scan.showObjects.toggle()
+                    }
                 }
                 .padding(.bottom, 6)
 
                 HStack(spacing: 10) {
-                    Button { scan.save() } label: {
+                    Button { scan.save(location: location.current) } label: {
                         HStack {
                             if scan.isSaving { ProgressView() }
-                            Text(scan.isSaving ? "Saving…" : "Save scan")
+                            Text(scan.isSaving ? scan.saveStep : "Save scan").lineLimit(1).minimumScaleFactor(0.7)
                         }
                         .font(.headline).frame(maxWidth: .infinity).padding(.vertical, 12)
                     }
@@ -86,7 +109,18 @@ struct ScanView: View {
                 .padding(.horizontal).padding(.bottom, 8)
             }
         }
-        .sheet(item: $scansSheet) { ScansListView(open: $0.open) }
+        .sheet(item: $scansSheet) { route in
+            ScansListView(open: route.open) { picked in
+                scansSheet = nil
+                scan.continueScan(picked)
+            }
+        }
+        .task(id: "\(location.current.map { "\(Int($0.latitude * 5000)),\(Int($0.longitude * 5000))" } ?? "-")\(scansSheet == nil)") {
+            // Look for saved scans close by whenever the position moves ~20 m or the sheet closes.
+            guard scansSheet == nil else { return }
+            let all = await Task.detached { ScanBundle.list() }.value
+            nearby = location.nearbyScans(all).first
+        }
         // The camera stops while the scans sheet covers it and comes back live afterwards.
         .onChange(of: scansSheet?.id) { _, id in id == nil ? scan.resumeCamera() : scan.suspendCamera() }
         .onChange(of: scan.savedScan) { _, saved in
@@ -99,6 +133,7 @@ struct ScanView: View {
         .onAppear { UIApplication.shared.isIdleTimerDisabled = true }
         .task {
             scan.startCamera()
+            location.start()
             // `devicectl device process launch ... com.vebjorn.LidarScan -autostart` starts scanning
             // without a tap, so a run can be observed from the Mac.
             if ProcessInfo.processInfo.arguments.contains("-autostart") {
