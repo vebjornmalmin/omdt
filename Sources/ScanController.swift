@@ -440,8 +440,11 @@ final class ScanController: NSObject, ObservableObject, ARSessionDelegate {
                     let kept = room.objects ?? []
                     debug.log("saved room: \(kept.count) boxes, \(kept.filter { $0.label != nil }.count) named, "
                               + "\(room.removed?.count ?? 0) removed")
+                    step("room", next: "Building the objects…")
+                    // The 3D objects; naming from photos follows on the scan screen.
+                    RoomBuild.objects(room, meshes: meshes, scan: bundle)
                 }
-                step("room", next: nil)
+                step("objects", next: nil)
                 debug.log(String(format: "saved %@: %d keyframes, %d tris in %.1f s", bundle.meta.id,
                                  bundle.meta.keyframeCount, bundle.meta.triangleCount, Date().timeIntervalSince(t0)))
                 DispatchQueue.main.async {

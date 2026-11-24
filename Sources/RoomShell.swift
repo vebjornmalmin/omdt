@@ -57,6 +57,11 @@ struct RoomModel: Codable, Equatable {
     var roomType: String?
     /// `ObjectFinder.version` that found the boxes; missing in files from before it was stored.
     var finder: Int?
+    /// Colors of the floor and walls from the scan, RGB 0–1.
+    var floorRGB: [Float]?
+    var wallRGB: [Float]?
+    /// True once every box was named from its best photos (see `RoomObjects`).
+    var namedFromPhotos: Bool?
 
     /// True for a room whose boxes came from an older box finder; Snap again finds them anew.
     var hasOldBoxes: Bool { (finder ?? 0) < ObjectFinder.version }
@@ -80,6 +85,28 @@ extension ScanBundle {
 
     func saveRoom(_ room: RoomModel) throws {
         try Self.encoder.encode(room).write(to: url.appendingPathComponent(Self.roomFile), options: .atomic)
+    }
+
+    /// Scan pieces of the room's objects (see `RoomObjects`), one PLY each.
+    var objectsURL: URL { url.appendingPathComponent("objects", isDirectory: true) }
+
+    func savePieces(_ pieces: [String: MeshOut]) {
+        guard !pieces.isEmpty else { return }
+        try? FileManager.default.createDirectory(at: objectsURL, withIntermediateDirectories: true)
+        for (name, mesh) in pieces {
+            if let data = try? MeshExporter.plyData([mesh]) {
+                try? data.write(to: objectsURL.appendingPathComponent(name), options: .atomic)
+            }
+        }
+    }
+
+    /// The pieces a room's objects use, by file name; missing files are left out.
+    func loadPieces(_ room: RoomModel) -> [String: MeshOut] {
+        var out: [String: MeshOut] = [:]
+        for name in Set((room.objects ?? []).compactMap { $0.model?.piece }) {
+            if let m = try? MeshExporter.readPLY(objectsURL.appendingPathComponent(name)) { out[name] = m }
+        }
+        return out
     }
 }
 

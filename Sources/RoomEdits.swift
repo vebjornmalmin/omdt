@@ -163,6 +163,20 @@ struct RoomEditor {
         }
     }
 
+    /// Takes the 3D objects built for `built`'s boxes, for boxes that still have the size they
+    /// were built for. Not an undo step: objects follow from the boxes.
+    mutating func setObjects(from built: RoomModel) {
+        guard var list = room.objects else { return }
+        for b in built.objects ?? [] {
+            guard let m = b.model, let i = list.firstIndex(where: { $0.id == b.id }),
+                  zip(m.boxSize, list[i].size).allSatisfy({ abs($0 - $1) < 0.005 }) else { continue }
+            list[i].model = m
+        }
+        room.objects = list
+        room.floorRGB = built.floorRGB ?? room.floorRGB
+        room.wallRGB = built.wallRGB ?? room.wallRGB
+    }
+
     /// Removes a box. It is kept in `removed` so it stays out when the room is fitted again.
     mutating func delete(_ id: Int) {
         guard var b = box(id) else { return }

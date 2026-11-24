@@ -49,7 +49,10 @@ enum RoomCorrector {
 
         // 1. Keep out what was removed before.
         objects.removeAll { b in
-            guard b.source != "user", let r = removed.first(where: { covered(b, by: $0, shell: shell) }) else { return false }
+            // A box removed for being the room itself keeps nothing out: it would be found and
+            // removed again anyway, and everything in the room lies inside it.
+            guard b.source != "user",
+                  let r = removed.first(where: { $0.kind != "room" && covered(b, by: $0, shell: shell) }) else { return false }
             notes.append("kept box \(b.id) out (\(r.kind ?? "removed") \(r.id))")
             return true
         }

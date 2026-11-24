@@ -87,3 +87,39 @@ enum NamingSelfTest {
         log.log("self-test naming: done")
     }
 }
+
+/// Development check, run with `-selftest-build <scan id>`: the full automatic room build on a
+/// saved scan (snap, objects, names from photos, objects again), logged and saved to the scan.
+enum BuildSelfTest {
+    static var scanID: String? {
+        let a = ProcessInfo.processInfo.arguments
+        guard let i = a.firstIndex(of: "-selftest-build"), i + 1 < a.count else { return nil }
+        return a[i + 1]
+    }
+
+    static func run(_ id: String) async {
+        let log = Debug.shared
+        guard let scan = ScanBundle.list().first(where: { $0.meta.id == id }),
+              let mesh = try? MeshExporter.readPLY(scan.meshURL) else { log.log("self-test build: no scan \(id)"); return }
+        log.log("self-test build: \(id) started")
+        let t0 = Date()
+        let room = await Task.detached(priority: .userInitiated) { () -> RoomModel? in
+            guard let shell = try? RoomFitter.fit([mesh]) else { return nil }
+            let found = ObjectFinder.find(RoomFitter.sample([mesh], cell: 0.03), shell: shell)
+            let before = scan.loadRoom()
+            var tracker = BoxTracker(seed: before?.objects ?? [])
+            let objects = Array(tracker.update(found).prefix(found.count))
+            let (room, _) = RoomCorrector.correct(RoomModel(shell: shell, objects: objects, removed: before?.removed,
+                                                            roomType: before?.roomType, finder: ObjectFinder.version))
+            return RoomBuild.objects(room, meshes: [mesh], scan: scan, force: true)
+        }.value
+        guard let room else { log.log("self-test build: snap failed"); return }
+        log.log(String(format: "self-test build: objects in %.1f s", Date().timeIntervalSince(t0)))
+        var start = room; start.namedFromPhotos = nil
+        let done = await RoomBuild.nameFromPhotos(start, meshes: [mesh], scan: scan) { _ in }
+        for b in done.objects ?? [] {
+            log.log("self-test build: box \(b.id) \(b.label ?? "unnamed") → \(b.model?.source.rawValue ?? "none") \(b.model?.type ?? "")")
+        }
+        log.log(String(format: "self-test build: done in %.0f s", Date().timeIntervalSince(t0)))
+    }
+}

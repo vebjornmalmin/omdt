@@ -122,3 +122,28 @@ Apple's **RoomPlan** already outputs walls, doors, windows and ~16 furniture box
 steps 1–2 working faster, but it runs its own capture (sharing it with our TSDF fusion is uncertain), has a
 fixed category list and gives no control over splitting. Plan uses our own geometry; RoomPlan can be a
 one-day comparison spike if the shell/box quality disappoints.
+
+## Next: build the room as 3D objects
+
+Boxes are a step, not the result. After a scan the app builds the room itself, automatically:
+
+1. **Room.** Snap floor, walls and ceiling; walls and floor take the scan's own colour.
+2. **Names from several views.** Each box is named from its best 2–3 photos (`BoxViews` +
+   `BoxNamer`), then cleaned up as before; the geometry still decides what can change.
+3. **Cut out each object.** The scan's points inside the box, minus floor and wall.
+4. **Model it.** Per type, fitted to those points:
+   - table, desk: top at the measured height and footprint, legs or pedestals where the scan shows
+     them (four corner legs when none were seen), things standing on top as blocks;
+   - chair: seat, back on the side the high points are, legs;
+   - sofa: base and seat, back on the side the high points are, arms at the ends;
+   - bed: frame and mattress, headboard if seen;
+   - cabinet, wardrobe, shelf, appliance, TV and the like: a block;
+   Colours come from the scan points of each part.
+5. **Fall back to the scan.** When a model covers too few of the object's points (or the type has
+   no model: plants, lamps, things not named), the object is its cleaned, simplified piece of the
+   scan mesh instead.
+6. **Show and export the objects.** The Room screen and USDZ export show the models and pieces;
+   moving or turning a box moves its object; merge and split build it again.
+
+Runs after saving: geometry and models right away, then naming from photos in the background,
+rebuilding the objects whose names changed.

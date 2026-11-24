@@ -6,7 +6,10 @@ struct LidarScanApp: App {
         WindowGroup {
             ScanView()
                 .preferredColorScheme(.dark)
-                .task { if NamingSelfTest.requested { await NamingSelfTest.run() } }
+                .task {
+                    if NamingSelfTest.requested { await NamingSelfTest.run() }
+                    if let id = BuildSelfTest.scanID { await BuildSelfTest.run(id) }
+                }
         }
     }
 }

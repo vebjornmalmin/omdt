@@ -846,6 +846,10 @@ do {
     let cleaned = RoomCorrector.correct(withRoomBox).0
     check(RoomCorrector.correct(cleaned).0.objects?.count == cleaned.objects?.count,
           "a second clean up keeps the boxes that were inside the room-sized box")
+    var bigThing = withRoomBox; bigThing.objects = [rbox(51, (0, 3), (0, 1.8), (0, 1.8))]
+    bigThing.removed = cleaned.removed
+    check(RoomCorrector.correct(bigThing).0.objects?.contains { $0.id == 51 } == true,
+          "a removed room-sized box doesn't keep out a big thing inside it")
     // A room turned 30°: a removed wall piece doesn't keep out the sofa standing against it.
     do {
         let y: Float = 0.52, c = cos(y), s = sin(y)
@@ -868,6 +872,118 @@ do {
     check(RoomReview.cleanName("  Office Chair ") == "office chair" && RoomReview.cleanName("unknown") == nil && RoomReview.cleanName("") == nil,
           "names are cleaned")
 } catch { check(false, "room review threw \(error)") }
+
+// MARK: 3D objects
+
+do {
+    typealias P = ObjectModeler.Pt
+    let grey = SIMD3<Float>(0.5, 0.5, 0.5), wood = SIMD3<Float>(0.6, 0.4, 0.2), fabric = SIMD3<Float>(0.3, 0.4, 0.7)
+    /// Points on a horizontal rectangle at height y (facing up) and on its four sides down to `down`.
+    func slabPts(_ x0: Float, _ x1: Float, _ z0: Float, _ z1: Float, _ y: Float, down: Float? = nil, rgb: SIMD3<Float>) -> [P] {
+        var out: [P] = []
+        for x in stride(from: x0, through: x1, by: 0.02) { for z in stride(from: z0, through: z1, by: 0.02) {
+            out.append(P(x: x, h: y, z: z, n: SIMD3(0, 1, 0), rgb: rgb))
+        } }
+        if let d = down {
+            for h in stride(from: d, through: y, by: 0.02) {
+                for x in stride(from: x0, through: x1, by: 0.02) {
+                    out.append(P(x: x, h: h, z: z0, n: SIMD3(0, 0, -1), rgb: rgb)); out.append(P(x: x, h: h, z: z1, n: SIMD3(0, 0, 1), rgb: rgb))
+                }
+                for z in stride(from: z0, through: z1, by: 0.02) {
+                    out.append(P(x: x0, h: h, z: z, n: SIMD3(-1, 0, 0), rgb: rgb)); out.append(P(x: x1, h: h, z: z, n: SIMD3(1, 0, 0), rgb: rgb))
+                }
+            }
+        }
+        return out
+    }
+    func leg(_ x: Float, _ z: Float, to top: Float, rgb: SIMD3<Float>) -> [P] {
+        stride(from: Float(0.06), through: top, by: 0.02).flatMap { h in
+            [P(x: x - 0.02, h: h, z: z, n: SIMD3(-1, 0, 0), rgb: rgb), P(x: x + 0.02, h: h, z: z, n: SIMD3(1, 0, 0), rgb: rgb)]
+        }
+    }
+    func part(_ parts: [ModelPart], _ name: String) -> [ModelPart] { parts.filter { $0.name == name } }
+
+    // Table: 1.6 × 0.8 m top at 74 cm, four legs.
+    var table = slabPts(-0.8, 0.8, -0.4, 0.4, 0.74, rgb: wood)
+    for (x, z) in [(Float(-0.75), Float(-0.35)), (0.75, -0.35), (0.75, 0.35), (-0.75, 0.35)] { table += leg(x, z, to: 0.7, rgb: grey) }
+    if let t = ObjectModeler.table(table) {
+        let top = part(t.parts, "top").first, legs = part(t.parts, "leg")
+        check(top != nil && abs(top!.center[1] + top!.size[1] / 2 - 0.74) < 0.02 && abs(top!.size[0] - 1.6) < 0.06
+              && abs(top!.size[2] - 0.8) < 0.06, "table top is 1.6 × 0.8 m at 74 cm")
+        check(legs.count == 4 && legs.allSatisfy { abs($0.center[1] - $0.size[1] / 2) < 0.01 }, "table gets its four legs, from the floor (\(legs.count))")
+        check(abs((top?.rgb[0] ?? 0) - 0.6) < 0.01 && abs((legs.first?.rgb[0] ?? 0) - 0.5) < 0.01, "parts take their own colors")
+        check(t.above == nil && t.gap == nil, "nothing on the table: no scan piece")
+    } else { check(false, "table model") }
+    // Without legs seen: four guessed corner legs.
+    if let t = ObjectModeler.table(slabPts(-0.5, 0.5, -0.3, 0.3, 0.72, rgb: wood)) {
+        check(part(t.parts, "leg (not seen)").count == 4, "a table seen only from above gets four corner legs")
+    } else { check(false, "table without legs") }
+    // Dining table with chairs around and under it: only the top is modelled, the rest is scan.
+    var dining = slabPts(-0.9, 0.9, -0.45, 0.45, 0.75, rgb: wood)
+    for x in stride(from: Float(-0.7), through: 0.7, by: 0.7) {
+        for z: Float in [-0.55, 0.55] {
+            dining += slabPts(x - 0.2, x + 0.2, z - 0.2, z + 0.2, 0.46, down: 0.06, rgb: fabric).filter { $0.h < 0.6 || $0.n.y > 0.5 }
+        }
+    }
+    if let t = ObjectModeler.table(dining) {
+        check(t.gap != nil && t.parts.count == 1, "a table with chairs all round: top modelled, the rest left to the scan")
+    } else { check(false, "dining table") }
+    // Chair: 45 × 45 seat at 46 cm, back on +z up to 90 cm.
+    var chair = slabPts(-0.22, 0.22, -0.22, 0.22, 0.46, rgb: fabric)
+    for h in stride(from: Float(0.5), through: 0.9, by: 0.02) { for x in stride(from: Float(-0.22), through: 0.22, by: 0.02) {
+        chair.append(P(x: x, h: h, z: 0.22, n: SIMD3(0, 0, -1), rgb: fabric))
+    } }
+    for (x, z) in [(Float(-0.2), Float(-0.2)), (0.2, -0.2), (0.2, 0.2), (-0.2, 0.2)] { chair += leg(x, z, to: 0.42, rgb: grey) }
+    if let c = ObjectModeler.chair(chair) {
+        let back = part(c, "back").first
+        check(back != nil && back!.center[2] > 0.15 && abs(back!.center[1] + back!.size[1] / 2 - 0.9) < 0.03,
+              "chair back is on the side the high points are, up to 90 cm")
+        check(part(c, "leg").count == 4 && part(c, "seat").count == 1, "chair has a seat and four legs")
+    } else { check(false, "chair model") }
+    // Sofa: 2.0 × 0.9 m, seat at 45 cm, back along -z up to 85 cm, arms at both x ends to 65 cm.
+    var sofa = slabPts(-1.0, 1.0, -0.45, 0.45, 0.45, down: 0.06, rgb: fabric)
+    sofa += slabPts(-1.0, 1.0, -0.45, -0.25, 0.85, down: 0.5, rgb: fabric)
+    sofa += slabPts(-1.0, -0.8, -0.25, 0.45, 0.65, down: 0.5, rgb: fabric)
+    sofa += slabPts(0.8, 1.0, -0.25, 0.45, 0.65, down: 0.5, rgb: fabric)
+    if let p = ObjectModeler.sofa(sofa) {
+        let back = part(p, "back").first, arms = part(p, "arm")
+        check(back != nil && back!.center[2] < -0.2 && abs(back!.size[0] - 2.0) < 0.1, "sofa back runs along the back side")
+        check(arms.count == 2 && arms.allSatisfy { abs($0.center[0]) > 0.7 }, "sofa gets its two arms (\(arms.count))")
+        check(abs(ObjectModeler.fit(sofa, p) - 1) < 0.15, String(format: "sofa model covers its points (%.0f%%)", ObjectModeler.fit(sofa, p) * 100))
+    } else { check(false, "sofa model") }
+    // Bed: 1.6 × 2.0 m mattress top at 55 cm, headboard on -x to 1.1 m.
+    var bed = slabPts(-0.8, 0.8, -1.0, 1.0, 0.55, down: 0.1, rgb: SIMD3(0.9, 0.9, 0.9))
+    for h in stride(from: Float(0.6), through: 1.1, by: 0.02) { for z in stride(from: Float(-1.0), through: 1.0, by: 0.02) {
+        bed.append(P(x: -0.8, h: h, z: z, n: SIMD3(1, 0, 0), rgb: wood))
+    } }
+    if let b = ObjectModeler.bed(bed) {
+        check(part(b, "mattress").count == 1 && part(b, "headboard").first.map { $0.center[0] < -0.6 } == true,
+              "bed has a mattress and a headboard at its head")
+    } else { check(false, "bed model") }
+    // A cupboard is one block; a plant gets no model (left to the scan).
+    let cupboard = slabPts(-0.4, 0.4, -0.3, 0.3, 0.9, down: 0.02, rgb: grey)
+    check(ObjectModeler.block(cupboard).map { abs($0[0].size[1] - 0.9) < 0.03 && $0[0].center[1] - $0[0].size[1] / 2 == 0 } == true,
+          "a cupboard is one block from the floor")
+    let shell = RoomShell(floorY: 0, ceilingY: 2.5, ceilingObserved: true, yaw: 0, outline: [], walls: [], area: 20,
+                          extent: [5, 4], notes: "")
+    let plantBox = ObjectBox(id: 1, center: [0, 0.4, 0], size: [0.5, 0.8, 0.5], yaw: 0, points: 100, label: "plant", source: "model")
+    check(ObjectModeler.model(plantBox, points: cupboard, shell: shell) == nil, "a plant gets no model")
+    let hugeSofa = ObjectBox(id: 3, center: [0, 0.4, 0], size: [5.2, 0.8, 3.1], yaw: 0, points: 100, label: "sofa", source: "model")
+    check(ObjectModeler.model(hugeSofa, points: sofa, shell: shell) == nil, "a 5.2 m \"sofa\" holds more than a sofa: no model")
+    // Built objects are stale when the box changes size or what it is.
+    var tb = ObjectBox(id: 2, center: [0, 0.37, 0], size: [1.6, 0.74, 0.8], yaw: 0, points: 100, label: "table", source: "model")
+    tb.model = ObjectModeler.model(tb, points: table, shell: shell)
+    check(tb.model?.source == .modeled && !RoomObjects.isStale(tb), "a table box gets a table model")
+    if let m = tb.model {
+        let top = part(m.parts, "top").first
+        check(top.map { abs($0.center[1] + $0.size[1] / 2 - (0.74 - 0.37)) < 0.02 } == true, "parts are placed in the box's frame")
+    }
+    var grown = tb; grown.size[0] = 2.0
+    var renamed = tb; renamed.label = "sofa"
+    check(RoomObjects.isStale(grown) && RoomObjects.isStale(renamed), "a box that changed size or name needs its object built again")
+    let json = try ScanBundle.encoder.encode(RoomModel(shell: shell, objects: [tb]))
+    check(try ScanBundle.decoder.decode(RoomModel.self, from: json).objects?.first?.model == tb.model, "objects are saved with the room")
+} catch { check(false, "3D objects threw \(error)") }
 
 // Saved rooms remember which box finder made them; old files have none.
 do {

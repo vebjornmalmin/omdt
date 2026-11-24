@@ -17,8 +17,14 @@ walls and floor, plus one named box per piece of furniture. Everything runs on t
   on-device language model). Clean up merges fragments and removes wall, door and window pieces;
   Review lets the model read the whole room and suggest merges, renames and removals, which the
   geometry checks before applying.
-- **3D Room screen.** Move (snaps to walls), turn, rename, merge, split and delete boxes, with undo.
-  Tap a box to see the photos it was named from or ask the AI again. Export as USDZ or JSON.
+- **3D objects.** After saving, the app builds the room as 3D objects by itself: each thing is
+  named from its best photos, then modelled from its scan points (tables with their top and
+  legs, chairs, sofas with back and arms, beds, cupboards), coloured from the scan. Things
+  without a fitting model (plants, lamps, what stands on a desk) are their own cleaned piece of
+  the scan. Floor and walls take the scan's colours.
+- **3D Room screen.** Move (snaps to walls), turn, rename, merge, split and delete things, with
+  undo; changed things are built again. Tap one to see the photos it was named from or ask the
+  AI again. Switch between 3D objects and plain boxes. Export as USDZ or JSON.
 
 Plan and background: [ROOM_MODEL_PLAN.md](ROOM_MODEL_PLAN.md).
 

@@ -21,6 +21,8 @@ struct ObjectBox: Codable, Equatable, Identifiable {
     /// What the on-device model says this is: "furniture", "object", "wall", "floor", "ceiling",
     /// "door", "window" or "unclear". On removed boxes, why it was removed ("deleted" by hand).
     var kind: String?
+    /// The box as a 3D object (see `ObjectModeler`); nil until built.
+    var model: ObjectModel?
 
     var centerVec: SIMD3<Float> { SIMD3(center[0], center[1], center[2]) }
 

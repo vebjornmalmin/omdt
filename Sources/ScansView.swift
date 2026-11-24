@@ -96,6 +96,10 @@ final class ScanViewerModel: ObservableObject {
     @Published private(set) var objects: [ObjectBox] = []
     private var removedBoxes: [ObjectBox]?
     private var roomType: String?
+    /// The whole saved room (objects, colors, naming state); kept in step with what's shown.
+    private var saved: RoomModel?
+    /// What the automatic room build is doing, for the panel; nil when idle.
+    @Published private(set) var buildStep: String?
     /// Box finder version of the shown boxes (nil: from before versions were saved).
     @Published private(set) var finder: Int?
     private let boxes = BoxOverlay(labelHeight: 0.1)
@@ -141,12 +145,54 @@ final class ScanViewerModel: ObservableObject {
             scene.rootNode.addChildNode(boxes.root)
             if let saved {
                 removedBoxes = saved.removed; roomType = saved.roomType; finder = saved.finder
+                self.saved = saved
                 show(saved.shell, objects: saved.objects ?? [])
             }
         } catch {
             self.error = error.localizedDescription
         }
         isLoading = false
+        if saved != nil { Task { await autoBuild() } }
+    }
+
+    /// Builds the room's 3D objects where missing, then names every box from its photos and
+    /// builds again what changed. Runs by itself when a scan opens.
+    func autoBuild() async {
+        guard let mesh, let start = saved, buildStep == nil else { return }
+        let scan = self.scan
+        var room = start
+        if (room.objects ?? []).contains(where: RoomObjects.isStale) {
+            buildStep = "Building the objects…"
+            let r = room
+            room = await Task.detached(priority: .userInitiated) { RoomBuild.objects(r, meshes: [mesh], scan: scan) }.value
+            guard saved == start else { return restart() }
+            took(room)
+        }
+        if RoomBuild.needsNaming(room) {
+            buildStep = "Naming things from the photos…"
+            let before = room
+            let named = await Task.detached(priority: .userInitiated) {
+                await RoomBuild.nameFromPhotos(before, meshes: [mesh], scan: scan) { step in
+                    Task { @MainActor in self.buildStep = step }
+                }
+            }.value
+            // Something else changed the room meanwhile (Snap again, an edit): build that instead.
+            guard saved == before else { return restart() }
+            took(named)
+        }
+        buildStep = nil
+    }
+
+    private func restart() {
+        buildStep = nil
+        Task { await autoBuild() }
+    }
+
+    /// Shows a room the build or an edit produced.
+    private func took(_ room: RoomModel) {
+        saved = room
+        removedBoxes = room.removed; roomType = room.roomType; finder = room.finder
+        show(room.shell, objects: room.objects ?? [])
     }
 
     /// Fits floor, ceiling and walls to the mesh and saves them as room.json.
@@ -154,7 +200,7 @@ final class ScanViewerModel: ObservableObject {
         guard let mesh, !isSnapping else { return }
         isSnapping = true; roomError = nil
         let scan = self.scan, previous = objects, removed = removedBoxes, roomType = self.roomType
-        let result = await Task.detached(priority: .userInitiated) { () -> Result<(RoomShell, [ObjectBox], [ObjectBox]?), Error> in
+        let result = await Task.detached(priority: .userInitiated) { () -> Result<(RoomModel, [ObjectBox], [ObjectBox]?), Error> in
             Result {
                 let shell = try RoomFitter.fit([mesh])
                 let found = ObjectFinder.find(RoomFitter.sample([mesh], cell: 0.03), shell: shell)
@@ -164,16 +210,21 @@ final class ScanViewerModel: ObservableObject {
                                                                      roomType: roomType, finder: ObjectFinder.version))
                 for n in notes { Debug.shared.log("clean up: " + n) }
                 try? scan.saveRoom(room)
-                return (shell, room.objects ?? [], room.removed)
+                return (room, room.objects ?? [], room.removed)
             }
         }.value
         switch result {
-        case .success(let (shell, objects, removed)):
+        case .success(let (room, objects, removed)):
+            let shell = room.shell
             removedBoxes = removed
             finder = ObjectFinder.version
+            saved = room
             Debug.shared.log("snap to room \(scan.meta.id): \(shell.walls.count) walls, \(objects.count) boxes, "
                              + String(format: "%.1f m², %.2f m high, ", shell.area, shell.height) + shell.notes)
             show(shell, objects: objects)
+            isSnapping = false
+            await autoBuild()
+            return
         case .failure(let e):
             Debug.shared.log("snap to room FAILED: \(e)")
             roomError = e.localizedDescription
@@ -194,13 +245,12 @@ final class ScanViewerModel: ObservableObject {
     func keyframe(_ id: Int) -> Keyframe? { keyframes.first { $0.id == id } }
 
     /// The fitted room with its boxes, for the Room screen.
-    var roomModel: RoomModel? {
-        room.map { RoomModel(shell: $0, objects: objects, removed: removedBoxes, roomType: roomType, finder: finder) }
-    }
+    var roomModel: RoomModel? { saved }
     var scanGeometry: SCNGeometry? { meshNode.geometry }
 
     /// Shows a room edited on the Room screen (already saved there).
     func apply(_ edited: RoomModel) {
+        saved = edited
         room = edited.shell
         objects = edited.objects ?? []
         removedBoxes = edited.removed
@@ -293,6 +343,13 @@ struct ScanDetailView: View {
                 }
                 Text(room.notes).font(.caption2).foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
+                if let step = model.buildStep {
+                    HStack(spacing: 8) {
+                        ProgressView()
+                        Text(step).font(.footnote).foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
                 if (model.finder ?? 0) < ObjectFinder.version {
                     Text("These boxes were found by an older version. Tap ↻ to find them again; names are kept.")
                         .font(.footnote).foregroundStyle(.yellow).frame(maxWidth: .infinity, alignment: .leading)

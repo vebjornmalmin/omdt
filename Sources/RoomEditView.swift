@@ -26,6 +26,13 @@ final class RoomEditModel: ObservableObject {
     }
     @Published var merging = false
     @Published var showScan = false { didSet { ghost.isHidden = !showScan } }
+    /// Show the 3D objects (models and scan pieces) instead of plain boxes.
+    @Published var showObjects = true { didSet { if oldValue != showObjects { rebuildNodes() } } }
+    /// Scan pieces of the objects, by file name.
+    private var pieces: [String: MeshOut] = [:]
+    /// The scan mesh, loaded the first time a split or a rebuilt object needs it.
+    private var mesh: MeshOut?
+    @Published private(set) var buildingObjects = false
 
     let scene = SCNScene()
     let culler = WallCuller()
@@ -40,6 +47,12 @@ final class RoomEditModel: ObservableObject {
         self.onSave = onSave
         buildScene(scanGeometry)
         syncBoxes()
+        let scan = scan
+        Task { @MainActor in
+            pieces = await Task.detached(priority: .userInitiated) { scan.loadPieces(room) }.value
+            rebuildNodes()
+            rebuildStaleObjects()
+        }
     }
 
     var shell: RoomShell { editor.room.shell }
@@ -72,9 +85,9 @@ final class RoomEditModel: ObservableObject {
 
     private func buildScene(_ scanGeometry: SCNGeometry?) {
         let root = scene.rootNode
-        root.addChildNode(SCNNode(geometry: RoomScene.floorGeometry(shell)))
+        root.addChildNode(SCNNode(geometry: RoomScene.floorGeometry(shell, rgb: RoomScene.floorRGB(editor.room))))
         for w in shell.walls {
-            let n = RoomScene.wallNode(w, shell: shell)
+            let n = RoomScene.wallNode(w, shell: shell, rgb: RoomScene.wallRGB(editor.room))
             root.addChildNode(n)
             let mid = (SIMD2(w.start[0], w.start[1]) + SIMD2(w.end[0], w.end[1])) / 2
             culler.walls.append((n, mid, SIMD2(w.normal[0], w.normal[1])))
@@ -123,17 +136,34 @@ final class RoomEditModel: ObservableObject {
         }
     }
 
+    /// Rebuilds every box node (objects loaded, or the view switched between objects and boxes).
+    private func rebuildNodes() {
+        for (_, e) in boxNodes { e.node.removeFromParentNode() }
+        boxNodes = [:]
+        syncBoxes()
+    }
+
     private func makeBoxNode(_ b: ObjectBox, selected sel: Bool) -> SCNNode {
         let node = SCNNode()
         node.name = "box-\(b.id)"
         RoomScene.place(node, b)
         let cat = BoxCategory.of(b.label)
 
-        let solid = RoomScene.boxNode(b, transparency: sel ? 1 : 0.92)
+        // The 3D object, when shown and built; the box then only shows when selected (and still
+        // takes the taps).
+        let object = showObjects ? RoomScene.objectNode(b, piece: b.model?.piece.flatMap { pieces[$0] }) : nil
+        if let object {
+            object.simdPosition = .zero; object.simdEulerAngles = .zero
+            object.enumerateHierarchy { n, _ in n.categoryBitMask = 2 }
+            node.addChildNode(object)
+        }
+        let solid = RoomScene.boxNode(b, transparency: object != nil ? (sel ? 0.22 : 0) : (sel ? 1 : 0.92))
         solid.simdPosition = .zero; solid.simdEulerAngles = .zero
         solid.categoryBitMask = 2
+        if object != nil { solid.geometry?.firstMaterial?.writesToDepthBuffer = false; solid.renderingOrder = 55 }
         if sel { solid.geometry?.firstMaterial?.emission.contents = UIColor(white: 0.25, alpha: 1) }
         node.addChildNode(solid)
+        if object != nil && !sel { return withTag(node, b, cat, sel) }
 
         // Edges.
         let h = SIMD3(b.size[0], b.size[1], b.size[2]) / 2 + 0.002
@@ -154,17 +184,58 @@ final class RoomEditModel: ObservableObject {
         edges.renderingOrder = 60
         node.addChildNode(edges)
 
-        // Name tag above the box.
+        return withTag(node, b, cat, sel)
+    }
+
+    /// Adds the name tag above the box.
+    private func withTag(_ node: SCNNode, _ b: ObjectBox, _ cat: BoxCategory, _ sel: Bool) -> SCNNode {
         if let name = b.label {
             let tag = SCNNode(geometry: BoxOverlay.labelPlane(name, color: UIColor(cgColor: RoomScene.color(cat.rgb)),
                                                               height: sel ? 0.14 : 0.11))
-            tag.simdPosition = SIMD3(0, h.y + 0.12, 0)
+            tag.simdPosition = SIMD3(0, b.size[1] / 2 + 0.12, 0)
             let bc = SCNBillboardConstraint(); bc.freeAxes = .all
             tag.constraints = [bc]
             tag.renderingOrder = 100
             node.addChildNode(tag)
         }
         return node
+    }
+
+    /// Builds the objects of boxes that changed (merged, split, renamed) from the scan mesh.
+    func rebuildStaleObjects() {
+        let stale = Set(objects.filter(RoomObjects.isStale).map(\.id))
+        guard !stale.isEmpty, !buildingObjects else { return }
+        buildingObjects = true
+        let room = editor.room, scan = scan
+        Task { @MainActor in
+            defer { buildingObjects = false }
+            guard let mesh = await loadMesh() else { return }
+            let built = await Task.detached(priority: .userInitiated) {
+                let b = RoomObjects.build(room, meshes: [mesh], only: stale)
+                scan.savePieces(b.pieces)
+                return b
+            }.value
+            for n in built.notes { Debug.shared.log("room edit: " + n) }
+            pieces.merge(built.pieces) { _, new in new }
+            // Pieces were rewritten: drop their nodes so they're drawn from the new files.
+            for (name, _) in built.pieces {
+                if let id = Int(name.dropFirst("object-".count).dropLast(".ply".count)) {
+                    boxNodes[id]?.node.removeFromParentNode(); boxNodes[id] = nil
+                }
+            }
+            editor.setObjects(from: built.room)
+            syncBoxes(); save()
+            // Edits made meanwhile may have left more to build.
+            if objects.contains(where: RoomObjects.isStale) { Task { @MainActor in self.rebuildStaleObjects() } }
+        }
+    }
+
+    /// The scan mesh, read once.
+    private func loadMesh() async -> MeshOut? {
+        if let mesh { return mesh }
+        let url = scan.meshURL
+        mesh = await Task.detached(priority: .userInitiated) { try? MeshExporter.readPLY(url) }.value
+        return mesh
     }
 
     // MARK: edits
@@ -267,18 +338,18 @@ final class RoomEditModel: ObservableObject {
     func split() {
         guard let id = selected, !splitting else { return }
         splitting = true; boxNote = nil
-        let url = scan.meshURL, cached = scanPoints
+        let cached = scanPoints
         Task { @MainActor in
             defer { splitting = false }
             let pts: [SIMD3<Float>]
             if let cached {
                 pts = cached
             } else {
-                let loaded = await Task.detached(priority: .userInitiated) { () -> [SIMD3<Float>]? in
-                    guard let mesh = try? MeshExporter.readPLY(url) else { return nil }
-                    return RoomFitter.sample([mesh], cell: 0.03).map(\.p)
-                }.value
-                guard let loaded else { if selected == id { boxNote = "Couldn't read the scan to split this box." }; return }
+                guard let mesh = await loadMesh() else {
+                    if selected == id { boxNote = "Couldn't read the scan to split this box." }
+                    return
+                }
+                let loaded = await Task.detached(priority: .userInitiated) { RoomFitter.sample([mesh], cell: 0.03).map(\.p) }.value
                 scanPoints = loaded; pts = loaded
             }
             guard selected == id else { return }
@@ -370,7 +441,7 @@ final class RoomEditModel: ObservableObject {
 
     private func fixSelection() { if let s = selected, editor.box(s) == nil { selected = nil } }
 
-    private func commit() { syncBoxes(); save() }
+    private func commit() { syncBoxes(); save(); rebuildStaleObjects() }
 
     private func save() {
         do { try scan.saveRoom(editor.room) } catch { Debug.shared.log("room edit: save failed: \(error)") }
@@ -384,7 +455,7 @@ final class RoomEditModel: ObservableObject {
     func exportUSDZ() -> URL? {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("Room \(scan.meta.id).usdz")
         do {
-            try RoomScene.writeUSDZ(editor.room, to: url)
+            try RoomScene.writeUSDZ(editor.room, pieces: pieces, to: url)
             Debug.shared.log("room export: \(objects.count) boxes to \(url.lastPathComponent)")
             return url
         } catch {
@@ -420,10 +491,11 @@ struct RoomEditView: View {
                     .disabled(!model.editor.canUndo).accessibilityLabel("Undo")
                 Button { model.redo() } label: { Image(systemName: "arrow.uturn.forward") }
                     .disabled(!model.editor.canRedo).accessibilityLabel("Redo")
-                Button { model.showScan.toggle() } label: {
-                    Image(systemName: model.showScan ? "eye.fill" : "eye")
-                }
-                .accessibilityLabel(model.showScan ? "Hide the scan" : "Show the scan")
+                Menu {
+                    Toggle(isOn: $model.showObjects) { Label("3D objects", systemImage: "chair.lounge") }
+                    Toggle(isOn: $model.showScan) { Label("The scan", systemImage: "camera.metering.matrix") }
+                } label: { Image(systemName: model.showScan ? "eye.fill" : "eye") }
+                .accessibilityLabel("Show")
                 Menu {
                     Button { if let url = model.exportUSDZ() { share = ShareItem(url: url) } } label: {
                         Label("3D model (USDZ)", systemImage: "cube")
